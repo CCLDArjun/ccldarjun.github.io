@@ -17,6 +17,7 @@ text = template.render()
 ofile = re.sub(".jinja", "", args.file)
 ofile = re.sub("^templates/", "", ofile)
 
+print(ofile)
 with open(ofile, "w") as f:
     f.write(text)
 
