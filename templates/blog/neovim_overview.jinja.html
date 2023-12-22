@@ -1,0 +1,183 @@
+{% from "./templates/header.html" import build_header %}
+{{ build_header("Neovim Internals") }}
+<div class="main-content">
+<h1>Neovim Internals</h1>
+
+<p><i>This blog post is a tour of how Neovim works. You&#39;ll see the various systems at play and what happens when you press a key and how that is reflected back to you!</i></p>
+<h2 id="overview">Overview</h2>
+<p>When you launch Neovim in your terminal, it initiates a child process <code>nvim --embed</code>. This child process acts as a server to the original parent process. Over the years, these two processes have been decoupled enabling the development of projects like <a href="https://github.com/vscode-neovim/vscode-neovim">VsCode Neovim</a>, <a href="https://github.com/lunixbochs/ActualVim">ActualVim</a> and <a href="https://github.com/equalsraf/neovim-qt">Neovim Qt</a>. They leverage the Neovim server to provide vim keybindings outside the terminal. Consequently, they don&#39;t have to worry about the intricacies of Vim, which allows them to focus on enhancing the UI.</p>
+<h2 id="how-it-works">How it works</h2>
+<h3 id="rpc">RPC</h3>
+<p>The interaction between server and client relies on RPC. There is a call for <strong>everything</strong> they need to say and know: client sends keystrokes, mouse clicks and resizes from the user; the server responds with redraws, notifications, etc. To ensure the lowest latency, these exchanges are serialized into a binary format using the <a href="https://github.com/msgpack-rpc/msgpack-rpc">MessagePack RPC</a> library. Every millisecond here matters: the quicker the calls are parsed and acted upon, the more responsive the editor will feel. Neovim accepts RPC calls through standard input, <a href="https://en.wikipedia.org/wiki/Named_pipe">named pipes</a> and sockets.</p>
+
+<p> The following is a diagram to help understand what is going on. The client calls <code>nvim_input("l", 2)</code> to say it wants to insert 2 <code>l</code>'s at the cursor position. The embedded processes carrys this logic out and responds with a redraw. After the client gets the response, it should update its render grid to include those two <code>l</code>'s. </p>
+<pre style="padding: 0px"><code class="language-plaintext">
+(1)
++-------------------------------------+
+|1 print("he                          |
+|2                                    |              (2)
+|3                                    |              +-------------------+
+|4                                    |              |RPC                |
+|5                                    |              |                   |
+|6                                    +------------> +nvim_input("l",2)  |
+|7                                    |              |                   |
+|8                                    |              +---------+---------+
+|9                                    |                        |
+|10                                   |                        |
++-------------------------------------+                        |
+|hello_world.py                 Neovim|                        |
++-------------------------------------+                        |
+                        ^                                      |
+            (4)         |                                      |
+            +-----------+-----------+                 (3)      v
+            |RPC                    |                 +------------------------+
+            |                       |                 |nvim --embed process    |
+            |redraw([               |                 |                        |
+            |  "grid_line",         |                 |                        |
+            |  1,                   |                 |                        |
+            |  0,                   + <---------------+   *thinking noises*    |
+            |  1,                   |                 |                        |
+            |  [['l',2]],           |                 |                        |
+            |  False,               |                 |                        |
+            |])                     |                 +------------------------+
+            +-----------------------+
+</code></pre>
+<blockquote>
+    This is a simplified example to help illustrate the process. More on this <a href="#lets-look-at-some-rpc">later in the post</a>.
+</blockquote>
+
+<p>Neovim supports all of these channels of communication so multiple clients and plugins are able to connect to a single server instance. UI clients typically use standard input/output since they initiate the server; plugins use sockets or named pipes. Windows doesn&#39;t have <a href="https://en.wikipedia.org/wiki/Unix_domain_socket">Unix domain sockets</a>, so the plugins there always use named pipes. Thankfully, the server is built on top of <a href="https://libuv.org">libuv</a> which handles the I/O complexity and asynchronosity across different platforms.</p>
+<p>Here&#39;s what libuv does for us:</p>
+<pre style="padding: 0px"><code class="language-C">async while there are still events to process:
+    e = get the next event
+    if there is a callback associated with e:
+        call the callback
+</code></pre>
+<blockquote>
+<p><a href="http://docs.libuv.org/en/v1.x/guide/basics.html">There&#39;s a libuv overview</a> if you&#39;re interested in how it works. (I copied the pseudocode from there). </p>
+</blockquote>
+<p>This is <strong>very powerful</strong>. It has enabled the server to create <a href="https://teukka.tech/vimloop.html">asynchronous lua actions</a> and the ability to simultaneously handle multiple RPC clients over different communication channels. On the Neovim side, we just register callbacks on our standard input/output, sockets and named pipes and then libuv handles the rest! </p>
+<blockquote>
+<p>The asynchronous lua actions allow plugins to do intensive tasks without slowing down the rest of Neovim. For example, plugins like <a href="https://github.com/nvim-telescope/telescope.nvim">telescope</a> can grep the filesystem and update its interactive UI as the user interacts with it.</p>
+</blockquote>
+<p>Here&#39;s a backtrace to help illustrate:</p>
+<pre style="padding: 0px"><code>// the juicy stuff
+* handle_request() at channel.c:388:3 // &lt;-
+    parse_msgpack() at channel.c:374:7
+    receive_msgpack() at channel.c:308:3
+// some processing
+    read_event() at rstream.c:192:5
+    invoke_read_cb() at rstream.c:206:3
+    read_cb() at rstream.c:134:3
+//  lib uv part
+    uv__read() at stream.c:1143:7
+    uv__stream_io() at stream.c:1203:5
+    uv__io_poll() at kqueue.c:381:9
+    uv_run() at core.c:447:5
+    loop_uv_run() at loop.c:65:5
+</code></pre>
+<p>You can see, at the core of this program, libuv is spinning and polling for input. When it gets the input (i.e. RPC call indicating the user has typed something), it returns execution back to Neovim providing it with an input buffer. Neovim reads and parses it into an RPC call and passes it onto <a href="https://github.com/neovim/neovim/blob/8405649f92a8a8eb254944eca15e8b0169cbb6fb/src/nvim/msgpack_rpc/channel.c#L385-L429"><code>handle_request()</code></a>. Let&#39;s look at the implementation!</p>
+<p>This function is responsible to <em>queue</em> the handling of RPC calls. They are queued because these calls can come in simultaneously. <code>Unpacker</code> is the result of the RPC parser and a <code>Channel</code> is equivalent to a channel of communication. Here it is simplified:</p>
+<pre style="padding: 0px"><code class="language-C">/// Handles requests and notifications received on the channel.
+static void handle_request(Channel *channel, Unpacker *p, Array args)
+  FUNC_ATTR_NONNULL_ALL
+{
+  ... // &lt;- some error handling
+  RequestEvent *evdata = xmalloc(sizeof(RequestEvent));
+  evdata-&gt;type = p-&gt;type;
+  evdata-&gt;channel = channel;
+  evdata-&gt;handler = p-&gt;handler;
+  evdata-&gt;args = args;
+  evdata-&gt;used_mem = p-&gt;arena;
+  p-&gt;arena = (Arena)ARENA_EMPTY;
+  evdata-&gt;request_id = p-&gt;request_id;
+  channel_incref(channel);
+  if (p-&gt;handler.fast) {
+    bool is_get_mode = p-&gt;handler.fn == handle_nvim_get_mode;
+
+    if (is_get_mode &amp;&amp; !input_blocking()) {
+      // Defer the event to a special queue used by os/input.c. #6247
+      multiqueue_put(ch_before_blocking_events, request_event, 1, evdata);
+    } else {
+      // Invoke immediately.
+      request_event((void **)&amp;evdata);
+    }
+  } else {
+    bool is_resize = p-&gt;handler.fn == handle_nvim_ui_try_resize;
+    if (is_resize) {
+      ... // &lt;- handle some special resizing case
+    } else {
+      multiqueue_put(channel-&gt;events, request_event, 1, evdata);
+      DLOG(&quot;RPC: scheduled %.*s&quot;, (int)p-&gt;method_name_len, p-&gt;handler.name);
+    }
+  }
+}
+</code></pre>
+<p>You may have realized from that code that I lied! Not <em>all</em> RPC calls are queued. Functions with the <code>fast</code> flag skip the queue. These are typically reserved for calls that are directly user facing like <code>nvim_input()</code>, <code>nvim_input_mouse()</code>, <code>nvim_eval_statusline()</code>, etc. Again, this is to ensure even lesser latency for the user. In other cases, the RPC call will be put onto a queue and scheduled to execute later.</p>
+
+<h2 id="lets-look-at-some-rpc">Let&#39;s look at some RPC</h2>
+
+<p>Let's see what happens when we type an `a` in insert mode. There's a simple call the client makes:</p>
+<pre style="padding: 0px"><code class="language-python">[2, &#39;nvim_input&#39;, [&#39;a&#39;]]
+</code></pre>
+<ul>
+    <li>The <code>2</code> signifies the channel id</li>
+    <li><code>nvim_input</code> is the name of the function</li>
+    <li><code>[&#39;a&#39;]</code> is the argument to the function</li>
+</ul>
+<p>What the server sends back</p>
+<pre style="padding: 0px"><code class="language-python">[2,
+ &#39;redraw&#39;,
+ [[&#39;grid_line&#39;,
+   [1, 0, 0, [[&#39;a&#39;, 0]], False],
+   [1, 31, 113, [[&#39;1&#39;, 9], [&#39;,&#39;], [&#39;2&#39;]], False]],
+  [&#39;win_viewport&#39;,
+   [2, ExtType(code=1, data=b&#39;\xcd\x03\xe8&#39;), 0, 2, 0, 1, 1, 0]],
+  [&#39;grid_cursor_goto&#39;, [1, 0, 1]],
+  [&#39;flush&#39;, []]]]
+</code></pre>
+<ul>
+    <li>Again, the channel id</li>
+    <li><code>redraw</code> is the name of the function</li>
+    <li><code>[[&#39;grid_line&#39;, ...]]</code> allows the server to batch multiple UI events into one call</li>
+    <ul>
+        <li><code>[1, 0, 0, [[&#39;a&#39;, 0]], False]</code> reflects the <code>a</code> we're inserting</li>
+        <ul>
+            <li><code>1</code> is the grid id</li>
+            <li><code>0</code> is the row</li>
+            <li><code>0</code> is the column</li>
+            <li><code>[[&#39;a&#39;, 0]]</code> is the text to insert. <code>0</code> is how many times to repeat the character</li>
+            <li><code>False</code> is whether to truncate the line</li>
+        </ul>
+        <li>This second UI event<code>[1, 31, 113, [['1', 9], [','], ['2']], False]]</code>  is to update the <code>&lt;row&gt;</code>,<code>&lt;column&gt;</code> of the cursor shown at the bottom right of vim
+    </ul>
+    <li><code>win_viewport</code> shows which buffer text is displayed in the window</li>
+    <ul>
+        <li><code>[2, ExtType(code=1, data=b&#39;\xcd\x03\xe8&#39;), 0, 2, 0, 1, 1, 0]]</code> is for the only grid</li>
+        <ul>
+            <li><code>2</code> is the grid id</li>
+            <li><code>ExtType(code=1, data=b&#39;\xcd\x03\xe8&#39;)</code>unsure about this. Seems to be an identifier for the window</li>
+            <li><code>0</code> is the topmost line of the buffer displayed in the window</li>
+            <li><code>2</code> is the bottom-most line of the buffer displayed in the window</li>
+            <li><code>0</code> is the index of the cursor line within the buffer</li>
+            <li><code>1</code> is the column of the cursor line within the buffer</li>
+            <li><code>1</code> is the total number of lines in the buffer</li>
+            <li><code>0</code> is <code>scroll_delta</code> which is to show how much the top line of the window has moved since the last <code>win_viewport</code> call</li>
+        </ul>
+    </ul>
+    <blockquote>I haven't looked into <code>win_viewport</code> much. The docs say <code>scroll_delta</code> is useful for implementing smooth scrolling. I think the rest of the parameters are mainly useful for GUI clients or plugins making context aware decisions.</blockquote>
+    <li><code>grid_cursor_goto</code> is to update the cursor position</li>
+    <ul>
+        <li><code>[1, 0, 1]</code> is the grid id, row, column</li>
+    </ul>
+    <li><code>flush</code> is to flush the UI events to the screen. When there are multiple batches of UI events, the last one is sent with a flush so the screen doesn't have to be redundantly redrawn.</li>
+</ul>
+
+and the result,
+
+<h2><img src="../images/neovim-rpc-example.png"/></h2>
+</div>
+
+</body>
+</html>
+
