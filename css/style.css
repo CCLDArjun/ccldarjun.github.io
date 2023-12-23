@@ -4,6 +4,7 @@
   font-family: "Helvetica", "Arial", sans-serif;
   line-height: 1.5;
   padding: 2em 1em;
+  color: #333;
 }
 
 .topnav {
@@ -22,7 +23,6 @@
   border-radius: 12px;
   margin-right: 10px;
 }
-
 
 .topnav a.larger-size {
     padding: 20px 25px;
@@ -56,6 +56,15 @@ h2 {
 
 h4 {
     padding: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+strong {
+  color: #111;
 }
 
 code,
@@ -106,5 +115,16 @@ img {
     color: black;
     background-color: green;
   }
+  .main-content {
+      color: #bbb;
+  }
+   h1,
+   h2,
+   h3,
+   h4,
+   h5,
+   strong {
+     color: #eee;
+   }
 }
 
