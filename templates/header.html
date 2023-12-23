@@ -19,10 +19,19 @@
 </head>
 
 <body>
-<nav>
-    <a href="/index.html"><h1><code>Arjun's</code></h1></a>
-    <a href="/about.html"><code>About</code></a>
-</nav>
+
+<div class="topnav">
+{% if title == "Arjun's" %}
+  <a class="active" href="/">Arjuns</a>
+{% else %}
+  <a href="/">Arjuns</a>
+{% endif %}
+{% if title == "About" %}
+  <a class="active" href="/about.html">About</a>
+{% else %}
+  <a href="/about.html">About</a>
+{% endif %}
+</div>
 
 {% endmacro %}
 

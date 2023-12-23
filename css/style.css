@@ -6,6 +6,29 @@
   padding: 2em 1em;
 }
 
+.topnav {
+  overflow: hidden;
+}
+
+/* Style the links inside the navigation bar */
+.topnav a {
+  float: left;
+  color: black;
+  text-align: center;
+  padding: 14px 16px;
+  text-decoration: none;
+  font-size: 17px;
+  background-color: #ddd;
+  border-radius: 12px;
+  margin-right: 10px;
+}
+
+/* Add a color to the active/current link */
+.topnav a.active {
+  color: black;
+  background-color: yellow;
+}
+
 nav {
     max-width: 50em;
 }
@@ -68,6 +91,14 @@ img {
   pre {
       background: rgba(20, 20, 20, 1);
       color: green;
+  }
+  .topnav a {
+      background: rgba(20, 20, 20, 1);
+      color: green;
+  }
+  .topnav a.active {
+    color: black;
+    background-color: green;
   }
 }
 
