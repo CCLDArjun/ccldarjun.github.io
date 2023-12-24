@@ -83,7 +83,7 @@ pre {
 
 a {
     color: black;
-    background: rgba(255, 255, 0, .7);
+    background: rgba(255, 255, 0, .35);
 }
 
 img {
@@ -97,7 +97,8 @@ img {
     color: white;
   }
   a {
-      background: rgba(0, 255, 0, 1);
+      background: rgba(0, 90, 0, 0);
+      color: #007d00;
   }
   nav a{
       background: rgba(20, 20, 20, 1);
